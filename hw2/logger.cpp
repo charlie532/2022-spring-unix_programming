@@ -18,9 +18,11 @@ using namespace std;
 extern "C" {
     static int (*old_chmod)(const char *, mode_t) = NULL;
     static int (*old_creat)(const char *, mode_t) = NULL;
+    static int (*old_creat64)(const char *, mode_t) = NULL;
     static int (*old_chown)(const char *, uid_t, gid_t) = NULL;
     static int (*old_remove)(const char *) = NULL;
     static int (*old_open)(const char *, int , ...) = NULL;
+    static int (*old_open64)(const char *, int , ...) = NULL;
     static int (*old_rename)(const char *, const char *) = NULL;
     static ssize_t (*old_write)(int, const void *, size_t) = NULL;
     static ssize_t (*old_read)(int, const void *, size_t) = NULL;
@@ -28,8 +30,10 @@ extern "C" {
     static size_t (*old_fread)(void *, size_t, size_t, FILE *) = NULL;
     static size_t (*old_fwrite)(const void *, size_t, size_t, FILE *) = NULL;
     static FILE *(*old_fopen)(const char *, const char *) = NULL;
+    static FILE *(*old_fopen64)(const char *, const char *) = NULL;
     static int (*old_fclose)(FILE *stream) = NULL;
     static FILE *(*old_tmpfile)(void) = NULL;
+    static FILE *(*old_tmpfile64)(void) = NULL;
 
     char *buf_filter(const void *buf, char *new_buf) {
         const char *buf_ptr = (char*)buf;
@@ -101,6 +105,22 @@ extern "C" {
         return return_val;
     }
 
+    int creat64(const char *pathname, mode_t mode) {
+        void *handle = dlopen(LIBM_SO, RTLD_LAZY);
+        *(void **)(&old_creat64) = get_old_func("creat64", handle);
+
+        int return_val = (*old_creat64)(pathname, mode);
+
+        char temp_path[MAX_PATH_LEN];
+        char *abs_path = get_abs_path(pathname, temp_path);
+        char *fd = getenv("file_out");
+        dprintf(atoi(fd), "[logger] creat64(\"%s\", %o) = %d\n", abs_path, mode, return_val);
+        
+        dlclose(handle);
+
+        return return_val;
+    }
+
     int chown(const char *pathname, uid_t owner, gid_t group) {
         void *handle = dlopen(LIBM_SO, RTLD_LAZY);
         *(void **)(&old_chown) = get_old_func("chown", handle);
@@ -151,6 +171,30 @@ extern "C" {
         char *abs_path = get_abs_path(pathname, temp_path);
         char *fd = getenv("file_out");
         dprintf(atoi(fd), "[logger] open(\"%s\", %o, %o) = %d\n", abs_path, flags, mode, return_val);
+        
+        dlclose(handle);
+
+        return return_val;
+    }
+
+    int open64(const char *pathname, int flags, ...) {
+        void *handle = dlopen(LIBM_SO, RTLD_LAZY);
+        *(void **)(&old_open64) = get_old_func("open64", handle);
+
+        mode_t mode = 0;
+        if (__OPEN_NEEDS_MODE(flags)) {
+            va_list arg;
+            va_start(arg, flags);
+            mode = va_arg(arg, mode_t);
+            va_end (arg);
+        }
+
+        int return_val = (*old_open64)(pathname, flags, mode);
+
+        char temp_path[MAX_PATH_LEN];
+        char *abs_path = get_abs_path(pathname, temp_path);
+        char *fd = getenv("file_out");
+        dprintf(atoi(fd), "[logger] open64(\"%s\" %o, %o) = %d\n", abs_path, flags, mode, return_val);
         
         dlclose(handle);
 
@@ -304,6 +348,22 @@ extern "C" {
         return return_val;
     }
 
+    FILE *fopen64(const char *pathname, const char *mode) {
+        void *handle = dlopen(LIBM_SO, RTLD_LAZY);
+        *(void **)(&old_fopen64) = get_old_func("fopen64", handle);
+
+        FILE *return_val = (*old_fopen64)(pathname, mode);
+
+        char temp_path[MAX_PATH_LEN];
+        char *abs_path = get_abs_path(pathname, temp_path);
+        char *fd = getenv("file_out");
+        dprintf(atoi(fd), "[logger] open64(\"%s\", \"%s\") = %p\n", abs_path, mode, return_val);
+        
+        dlclose(handle);
+
+        return return_val;
+    }
+
     int fclose(FILE *stream) {
         void *handle = dlopen(LIBM_SO, RTLD_LAZY);
         *(void **)(&old_fclose) = get_old_func("fclose", handle);
@@ -332,6 +392,20 @@ extern "C" {
 
         char *fd = getenv("file_out");
         dprintf(atoi(fd), "[logger] tmpfile() = %p\n", return_val);
+        
+        dlclose(handle);
+
+        return return_val;
+    }
+
+    FILE *tmpfile64(void) {
+        void *handle = dlopen(LIBM_SO, RTLD_LAZY);
+        *(void **)(&old_tmpfile64) = get_old_func("tmpfile64", handle);
+
+        FILE *return_val = (*old_tmpfile64)();
+
+        char *fd = getenv("file_out");
+        dprintf(atoi(fd), "[logger] tmpfile64() = %p\n", return_val);
         
         dlclose(handle);
 
