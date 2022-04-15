@@ -117,4 +117,5 @@ The detailed spec of this homework is introduced as follows. Your program has to
   * If the filename you read from /proc file system contains a ` (deleted)`, please remove it from the filename before you print it out.
 ## Additional Notes on REGEX
 If you plan to test REGEX feature with the `lsof` package that comes with Linux distributions, you should run it with the option `-c /REGEX/`.
+
 For students who programming with C++, consider working with `regex_search()` instead of `regex_match()`. Please work with `regcomp()` and `regexec()` for students who are programming with C to implement this feature.
