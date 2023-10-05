@@ -1,12 +1,10 @@
 load sample/hello64
 start
 b 0x4000c6
+l
 cont
-get rip
 set rip 0x4000b0
 cont
-get rip
+delete 0
 set rip 0x4000b0
 cont
-cont
-

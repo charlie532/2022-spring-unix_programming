@@ -1,0 +1,8 @@
+load sample/hello64
+start
+b 0x4000b5
+b 0x4000ba
+cont
+si
+cont
+run

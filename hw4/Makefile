@@ -1,12 +1,10 @@
 CXX = g++
-PROGS = sdb.o
 CFLAGS = -g -Wall
+FILE_NAME = hw4.cpp
+EXE_NAME = hw4
 
-hw4: $(PROGS)
-	$(CXX) $^ -o $@ $(CFLAGS) -lcapstone
-
-%.o: %.cpp
-	$(CXX) $< -c -o $@ $(CFLAGS)
+all:
+	$(CXX) -o $(EXE_NAME) $(FILE_NAME) $(CFLAGS) -lcapstone
 
 clean:
-	rm -f *.o hw4
+	rm -f $(EXE_NAME)

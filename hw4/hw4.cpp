@@ -1,14 +1,87 @@
-#include "sdb.h"
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <cstring>
+#include <capstone/capstone.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdio.h>
+#include <algorithm>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <unordered_map>
+#include <sstream>
 
+using namespace std;
+
+#define WORD 8
+#define DISASM_LEN 10
+#define ELF_ENTRY_POINT_OFFSET 0x18
+#define ELF_ENTRY_POINT_SIZE 0x08
+#define ELF_HEADER_SIZE 0x40
+#define DUMP_SIZE 80
+#define DUMP_WIDTH 16
+
+enum sdb_state{
+    not_load,
+    loaded,
+    running,
+    terminated,
+};
+
+enum vmmap_list{
+    vm_region,
+    vm_flags,
+    vm_pgoff,
+    vm_dev,
+    vm_node,
+    vm_path,
+};
+
+struct break_point {
+    unsigned long long addr;
+    int id;
+    unsigned char origin_content;
+};
+
+struct arguments {
+    string script;
+    string program_path;
+    bool is_script;
+};
+
+struct prog_info {
+    sdb_state state;
+    unsigned long long entry_point;
+    string loaded_prog;
+    pid_t pid;
+    unsigned long long text_start;
+    unsigned long long text_end;
+    vector<break_point> bps;
+    int bp_id;
+};
+
+using namespace std;
+
+typedef void (*func_ptr)(vector<string> args);
 unordered_map<string, func_ptr> commands;
+
 static const string state_name[] = {"not_load", "loaded", "running"};
-struct user_regs_struct regs;
+
+user_regs_struct regs;
+
 const string all_regs_list[] = {
     "rax", "rbx", "rcx", "rdx",
-    "r8", "r9", "r10", "r11",
+    "r8",  "r9",  "r10", "r11",
     "r12", "r13", "r14", "r15",
     "rdi", "rsi", "rbp", "rsp",
-    "rip", "flags"};
+    "rip", "flags"
+};
+
 prog_info info = {
     .state = not_load,
     .entry_point = 0,
@@ -21,6 +94,7 @@ prog_info info = {
         cerr << "** This command is valid for '" << state_name[cur] << "', but current state is '" << state_name[info.state] << "'\n"; \
         return;                                                                                                                        \
     }
+
 #define _WIFEXITED(status)                                                                               \
     if (WIFEXITED(status)) {                                                                             \
         dprintf(STDERR_FILENO, "** child process %d terminated normally (code %d)\n", info.pid, status); \
@@ -28,35 +102,17 @@ prog_info info = {
         return;                                                                                          \
     }
 
-/* helper functions */
-static void init_commands() {
-    commands["break"] = &set_bp;
-    commands["b"] = &set_bp;
-    commands["cont"] = &cont;
-    commands["c"] = &cont;
-    commands["delete"] = &delete_bp;
-    commands["disasm"] = &disasm;
-    commands["dump"] = &dump;
-    commands["x"] = &dump;
-    commands["exit"] = &exit;
-    commands["q"] = &exit;
-    commands["get"] = &get_reg;
-    commands["g"] = &get_reg;
-    commands["getregs"] = &get_all_regs;
-    commands["help"] = &help;
-    commands["h"] = &help;
-    commands["list"] = &list_bp;
-    commands["l"] = &list_bp;
-    commands["load"] = &load;
-    commands["run"] = &run;
-    commands["r"] = &run;
-    commands["vmmap"] = &vmmap;
-    commands["m"] = &vmmap;
-    commands["set"] = &set_reg;
-    commands["s"] = &set_reg;
-    commands["si"] = &single_step;
-    commands["start"] = &start;
-}
+#define check_text_segment(addr)                                            \
+    if ((addr < info.text_start) || (addr >= info.text_end)) {              \
+        cerr << "** the address is out of the range of the text segment\n"; \
+        return;                                                             \
+    }
+
+#define check_argv(argv, req)                     \
+    if (argv.size() < 2) {                        \
+        cerr << "** no " << req << " is given\n"; \
+        return;                                   \
+    }
 
 static inline void call_cmd(vector<string> argv) {
     auto it = commands.find(argv[0]);
@@ -77,7 +133,7 @@ static vector<string> split_str(string line) {
     return ret;
 }
 
-static inline void errquit(const char *msg) {
+static inline void err_quit(const char *msg) {
     cerr << msg << endl;
     exit(-1);
 }
@@ -117,31 +173,27 @@ static unordered_map<string, unsigned long long *> _get_all_regs() {
     return _regs;
 }
 
-struct arguments parse_arg(int argc, char *argv[]) {
+arguments parse_arg(int argc, char *argv[]) {
     int cmd_opt;
-    struct arguments args = {
+    arguments args = {
         .script = "",
-        .prog_path = "",
+        .program_path = "",
         .is_script = false,
-        .is_invalid = false,
     };
 
     while ((cmd_opt = getopt(argc, argv, "s:")) != -1) {
         switch (cmd_opt) {
-        case 's':
-            args.script = optarg;
-            break;
-        case '?':
-            cerr << "usage: ./hw4 [-s script] [program]" << endl;
-            args.is_invalid = true;
-            break;
-        default:
-            break;
+            case 's':
+                args.script = optarg;
+                break;
+            case '?':
+                cerr << "usage: ./hw4 [-s script] [program]" << endl;
+                exit(-1);
+            default:
+                break;
         }
     }
-    if (argc > optind) {
-        args.prog_path = argv[optind];
-    }
+    if (argc > optind) args.program_path = argv[optind]; // in the last place of input
 
     return args;
 }
@@ -152,84 +204,46 @@ static unsigned long long _stoull(string str) {
         base = 16;
     return stoull(str, NULL, base);
 }
-static void init_text_segment_addr() {
-    ifstream text_if("/proc/" + to_string(info.pid) + "/stat");
-    if (!text_if.is_open()) {
-        errquit("** vmmap fail to open the stat file\n");
-    } else {
-        string line;
 
-        if (!getline(text_if, line)) {
-            errquit("** vmmap fail to getline from stat\n");
-        }
-        auto item = split_str(line);
-        // start and end place
-        info.text_start = _stoull(item[25]);
-        info.text_end = _stoull(item[26]);
-    }
-    return;
-}
-
-static inline bool is_text_segment(unsigned long long addr) {
-    return (addr >= info.text_start) && (addr < info.text_end);
-}
-
-static void repatch_bps() {
-    for (auto bp = info.bps.begin(); bp != info.bps.end(); ++bp) {
-        auto code = ptrace(PTRACE_PEEKTEXT, info.pid, bp->addr, 0);
-        ptrace(PTRACE_POKETEXT, info.pid, bp->addr, (code & 0xffffffffffffff00) | 0xcc); // Software Breakpoint INT3(0xcc)
-    }
-}
-
-static long restore_orig_content(long raw, unsigned long long addr, size_t size) {
-    // size should less than long size
-    long ret = raw;
+static long restore_origin_content(long raw, unsigned long long addr, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         unsigned char *check_char = &(((unsigned char *)&raw)[i]);
-        unsigned char *ret_char = &(((unsigned char *)&ret)[i]);
         if (*check_char == 0xcc) {
             for (auto bp = info.bps.begin(); bp != info.bps.end(); ++bp) {
-                if (bp->addr == addr + i) {
-                    *check_char = bp->orig_content;
-                }
+                if (bp->addr == addr + i) *check_char = bp->origin_content;
             }
         }
-        *ret_char = *check_char;
     }
-    return ret;
+    return raw;
 }
 
 static void _disasm(const uint8_t *codes, size_t code_size, uint64_t addr, size_t _count) {
     static csh handle = 0;
     cs_insn *insn = NULL;
-    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
-        return;
-    }
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) return;
+
     size_t count = cs_disasm(handle, codes, code_size, addr, _count, &insn);
-    if (count > 0) {
-        for (size_t i = 0; i < count; ++i) {
-            if (!is_text_segment(insn[i].address)) {
-                cerr << "** the address is out of the range of the text segment\n";
-                return;
-            }
-            dprintf(STDERR_FILENO, "%12lx: ", insn[i].address);
-            for (int j = 0; j < insn[i].size; ++j) {
+    if (count <= 0) return;
+    for (size_t i = 0; i < count; ++i) {
+        check_text_segment(insn[i].address);
+
+        dprintf(STDERR_FILENO, "%12lx: ", insn[i].address);
+        for (int j = 0; j < 12; ++j) {
+            if (j < insn[i].size) {
                 dprintf(STDERR_FILENO, "%02x ", (unsigned int)insn[i].bytes[j]);
-            }
-            for (int j = 0; j < (12 - insn[i].size); ++j) {
+            } else {
                 dprintf(STDERR_FILENO, "   ");
             }
-
-            dprintf(STDERR_FILENO, "%-10s%s\n", insn[i].mnemonic, insn[i].op_str);
         }
-        cs_free(insn, count);
+        dprintf(STDERR_FILENO, "%-10s%s\n", insn[i].mnemonic, insn[i].op_str);
     }
+    cs_free(insn, count);
 }
 
 static void print_bp() {
     auto _reg = _get_all_regs();
     long raw = ptrace(PTRACE_PEEKTEXT, info.pid, *(_reg["rip"]), 0);
-    long codes = restore_orig_content(raw, *(_reg["rip"]), 1);
+    long codes = restore_origin_content(raw, *(_reg["rip"]), 1);
     dprintf(STDERR_FILENO, "** breakpoint @");
     // just disasm without restore to mem
     _disasm((uint8_t *)&codes, WORD - 1, *(_reg["rip"]), 1);
@@ -237,8 +251,44 @@ static void print_bp() {
 
 static bool is_encounter_cc(unsigned long long addr) {
     auto code = ptrace(PTRACE_PEEKTEXT, info.pid, addr, 0);
-    unsigned char *_char = ((unsigned char *)&code);
-    return *_char == 0xcc;
+    return *(unsigned char *)&code == 0xcc;
+}
+
+void set_bp(vector<string> argv) {
+    check_state(running);
+    check_argv(argv, "addr");
+    
+    unsigned long long addr = _stoull(argv[1]);
+    check_text_segment(addr);
+    if (addr == info.entry_point) {
+        cerr << "** the address should not be the same as the entry point\n";
+        return;
+    }
+
+    auto code = ptrace(PTRACE_PEEKTEXT, info.pid, addr, 0);
+    break_point new_bp = {addr, info.bp_id++, (unsigned char)code};
+    info.bps.push_back(new_bp);
+    // Software Breakpoint: INT3(0xcc)
+    ptrace(PTRACE_POKETEXT, info.pid, addr, (code & 0xffffffffffffff00) | 0xcc);
+}
+
+void delete_bp(vector<string> argv) {
+    check_argv(argv, "id");
+
+    int target_id = stoi(argv[1], NULL, 10);
+    auto bp = std::find_if(info.bps.begin(), info.bps.end(), [target_id](const break_point& bp) { return bp.id == target_id; });
+    if (bp != info.bps.end()) {
+        auto code = ptrace(PTRACE_PEEKTEXT, info.pid, bp->addr, nullptr);
+        ptrace(PTRACE_POKETEXT, info.pid, bp->addr, (code & 0xffffffffffffff00) | bp->origin_content); // replace 0xcc
+        info.bps.erase(bp);
+        dprintf(STDERR_FILENO, "** breakpoint %d deleted.\n", target_id);
+    }
+}
+
+void list_bp(vector<string> argv) {
+    for (auto bp : info.bps) {
+        dprintf(STDERR_FILENO, "  %d:%8llx\n", bp.id, bp.addr);
+    }
 }
 
 static void cont_end() {
@@ -246,95 +296,19 @@ static void cont_end() {
     waitpid(info.pid, &status, 0);
 
     _WIFEXITED(status);
+
     if (WIFSTOPPED(status)) {
         if (WSTOPSIG(status) != SIGTRAP) {
             dprintf(STDERR_FILENO, "** [cont] stopped by signal %d\n", WSTOPSIG(status));
         }
 
+        // because process stopped so %rip would point to next instruction, we want to let %rip stop at break point
         auto _reg = _get_all_regs();
         *(_reg["rip"]) -= 1;
         if (is_encounter_cc(*(_reg["rip"]))) {
-            // rip-1
             ptrace(PTRACE_SETREGS, info.pid, NULL, &regs);
             print_bp();
         }
-    }
-}
-
-static void si_end(int status) {
-    _WIFEXITED(status);
-    if (WIFSTOPPED(status)) {
-        if (WSTOPSIG(status) != SIGTRAP) {
-            dprintf(STDERR_FILENO, "** [si] stopped by signal %d\n", WSTOPSIG(status));
-        }
-
-        auto _reg = _get_all_regs();
-        if (is_encounter_cc(*(_reg["rip"]))) {
-            print_bp();
-        }
-    }
-}
-
-static void set_entry_point(const char *program) {
-    int fd = open(program, O_RDONLY);
-    unsigned char elf[ELF_HEADER_SIZE];
-    if (fd == -1) {
-        return;
-    }
-
-    // elf_header in executable file first 64 byte
-    read(fd, elf, ELF_HEADER_SIZE);
-
-    unsigned long long res = 0;
-    for (size_t i = ELF_ENTRY_POINT_SIZE + ELF_ENTRY_POINT_OFFSET - 1; i >= ELF_ENTRY_POINT_OFFSET; i--) {
-        res = res * 256 + elf[i];
-    }
-    info.entry_point = res;
-}
-
-/* implementation of sdb's using */
-void set_bp(vector<string> argv) {
-    check_state(running);
-    if (argv.size() < 2) {
-        cerr << "** no addr is given\n";
-        return;
-    }
-    unsigned long long addr = _stoull(argv[1]);
-    if (!is_text_segment(addr)) {
-        cerr << "** the address is out of the range of the text segment\n";
-        return;
-    }
-    if (addr == info.entry_point) {
-        cerr << "** the address should not be the same as the entry point\n";
-    }
-    auto code = ptrace(PTRACE_PEEKTEXT, info.pid, addr, 0);
-    break_point new_bp = {addr, ++info.bp_id, (unsigned char)code};
-    info.bps.push_back(new_bp);
-    // Software Breakpoint INT3(0xcc)
-    ptrace(PTRACE_POKETEXT, info.pid, addr, (code & 0xffffffffffffff00) | 0xcc);
-}
-
-void delete_bp(vector<string> argv) {
-    if (argv.size() < 2) {
-        cerr << "** no id is given\n";
-        return;
-    }
-    int target_id = stoi(argv[1], NULL, 10);
-    for (auto bp = info.bps.begin(); bp != info.bps.end(); ++bp) {
-        if (bp->id == target_id) {
-            auto code = ptrace(PTRACE_PEEKTEXT, info.pid, bp->addr, NULL);
-            // just replace the first byte instead of a word;
-            ptrace(PTRACE_POKETEXT, info.pid, bp->addr, (code & 0xffffffffffffff00) | bp->orig_content);
-            info.bps.erase(bp);
-            dprintf(STDERR_FILENO, "** breakpoint %d deleted.\n", target_id);
-            return;
-        }
-    }
-}
-
-void list_bp(vector<string> argv) {
-    for (auto bp : info.bps) {
-        dprintf(STDERR_FILENO, "  %d:%8llx\n", bp.id, bp.addr);
     }
 }
 
@@ -345,34 +319,45 @@ void cont(vector<string> argv) {
     long inst;
     if (is_encounter_cc(*(_reg["rip"]))) {
         inst = ptrace(PTRACE_PEEKTEXT, info.pid, *(_reg["rip"]), 0);
-        long orig = restore_orig_content(inst, *(_reg["rip"]), 1); // only restore 0xcc 1 byte;
-        ptrace(PTRACE_POKETEXT, info.pid, *(_reg["rip"]), orig);
+        long origin = restore_origin_content(inst, *(_reg["rip"]), 1); // only restore 0xcc 1 byte;
+        ptrace(PTRACE_POKETEXT, info.pid, *(_reg["rip"]), origin);
         has_restored = true;
     }
 
-    /* execute one instruction which may not been executed because of 0xcc */
+    // run only one instruciton after replacing break point with original contents
     ptrace(PTRACE_SINGLESTEP, info.pid, 0, 0);
     int status;
     waitpid(info.pid, &status, 0);
     _WIFEXITED(status);
 
-    if (has_restored) {
-        // set 0xcc back to the bp
-        ptrace(PTRACE_POKETEXT, info.pid, *(_reg["rip"]), inst);
-    }
+    // set 0xcc back if replaced
+    if (has_restored) ptrace(PTRACE_POKETEXT, info.pid, *(_reg["rip"]), inst);
+
     ptrace(PTRACE_CONT, info.pid, 0, 0);
     cont_end();
 }
 
+static void si_end(int status) {
+    _WIFEXITED(status);
+    if (WIFSTOPPED(status)) {
+        if (WSTOPSIG(status) != SIGTRAP) {
+            dprintf(STDERR_FILENO, "** [si] stopped by signal %d\n", WSTOPSIG(status));
+        }
+
+        auto _reg = _get_all_regs();
+        if (is_encounter_cc(*(_reg["rip"]))) print_bp();
+    }
+}
+
 void single_step(vector<string> argv) {
     check_state(running);
+    
     auto _reg = _get_all_regs();
     bool has_restored = false;
     long inst;
     if (is_encounter_cc(*(_reg["rip"]))) {
-        inst = ptrace(PTRACE_PEEKTEXT, info.pid, *(_reg["rip"]), 0);
-        // only restore 0xcc 1 byte;
-        long orig = restore_orig_content(inst, *(_reg["rip"]), 1);
+        inst = ptrace(PTRACE_PEEKTEXT, info.pid, *(_reg["rip"]), 0); // only restore 0xcc 1 byte;
+        long orig = restore_origin_content(inst, *(_reg["rip"]), 1);
         ptrace(PTRACE_POKETEXT, info.pid, *(_reg["rip"]), orig);
         has_restored = true;
     }
@@ -380,53 +365,45 @@ void single_step(vector<string> argv) {
     int status;
     waitpid(info.pid, &status, 0);
 
-    if (has_restored) {
-        // set 0xcc back to the bp
-        ptrace(PTRACE_POKETEXT, info.pid, *(_reg["rip"]), inst);
-    }
+    if (has_restored) ptrace(PTRACE_POKETEXT, info.pid, *(_reg["rip"]), inst); // set 0xcc back to the bp
     si_end(status);
 }
 
 void disasm(vector<string> argv) {
     check_state(running);
-    if (argv.size() < 2) {
-        cerr << "** no addr is given\n";
-        return;
-    }
+    check_argv(argv, "addr");
+    
     unsigned long long addr = _stoull(argv[1]);
-    if (!is_text_segment(addr)) {
-        cerr << "** the address is out of the range of the text segment\n";
-    }
+    check_text_segment(addr);
+    
     unsigned long long target_addr = addr;
-    long codes[DISASM_INS];
-    for (int i = 0; i < DISASM_INS; ++i) {
+    long codes[DISASM_LEN];
+    for (int i = 0; i < DISASM_LEN; ++i) {
         long content = ptrace(PTRACE_PEEKTEXT, info.pid, target_addr, 0);
-        codes[i] = restore_orig_content(content, target_addr, WORD);
+        codes[i] = restore_origin_content(content, target_addr, WORD);
         target_addr += WORD;
     }
-    _disasm((uint8_t *)codes, sizeof(codes) - 1, addr, DISASM_INS);
+    _disasm((uint8_t *)codes, sizeof(codes) - 1, addr, DISASM_LEN);
 }
 
 void dump(vector<string> argv) {
     check_state(running);
-    if (argv.size() < 2) {
-        cerr << "** no addr is given\n";
-        return;
-    }
-    unsigned long long addr = stoull(argv[1], NULL, 16);
-    int size = 80, line = 16;
+    check_argv(argv, "addr");
 
-    for (auto i = 0; i < size; i += line) {
+    unsigned long long addr = stoull(argv[1], NULL, 16);
+
+    for (auto i = 0; i < DUMP_SIZE; i += DUMP_WIDTH) {
         dprintf(STDERR_FILENO, "      %llx: ", addr);
+
         string mem = "";
-        for (auto j = 0; j < line; j += WORD, addr += WORD) {
+        for (auto j = 0; j < DUMP_WIDTH; j += WORD, addr += WORD) {
             auto tracee_mem = ptrace(PTRACE_PEEKTEXT, info.pid, addr, NULL);
             mem += string((char *)&tracee_mem, 8);
         }
-
         for (auto _char : mem) {
             dprintf(STDERR_FILENO, "%02x ", (unsigned char)_char);
         }
+
         cerr << "|";
         for (auto _char : mem) {
             dprintf(STDERR_FILENO, "%c", (!isprint(_char) ? '.' : _char));
@@ -437,6 +414,7 @@ void dump(vector<string> argv) {
 
 void get_reg(vector<string> argv) {
     check_state(running);
+    
     string target = argv[1];
     auto _regs = _get_all_regs();
     if (_regs.count(target)) {
@@ -448,11 +426,12 @@ void get_reg(vector<string> argv) {
 
 void get_all_regs(vector<string> argv) {
     check_state(running);
+
     auto _regs = _get_all_regs();
     int count = 0;
     for (auto reg : all_regs_list) {
         string upper_reg = reg;
-        transform(upper_reg.begin(), upper_reg.end(), upper_reg.begin(), [](char c){return toupper(c);});
+        transform(upper_reg.begin(), upper_reg.end(), upper_reg.begin(), [](char c){ return toupper(c); });
         if (upper_reg != "FLAGS") {
             dprintf(STDERR_FILENO, "%-3s %-16llx", upper_reg.c_str(), *_regs[reg]);
         } else {
@@ -460,13 +439,9 @@ void get_all_regs(vector<string> argv) {
         }
 
         count = (count + 1) % 4;
-        if (count == 0) {
-            cerr << endl;
-        }
+        if (count == 0) cerr << endl;
     }
-    if (count != 0) {
-        cerr << endl;
-    }
+    if (count != 0) cerr << endl;
 }
 
 void set_reg(vector<string> argv) {
@@ -498,23 +473,31 @@ void help(vector<string> argv) {
     cerr << "- start: start the program and stop at the first instruction\n";
 }
 
-void _load() {
-    if ((info.pid = fork()) < 0) {
-        errquit("**[load] fail to fork\n");
-        return;
+static void set_entry_point(const char *program) {
+    int fd = open(program, O_RDONLY);
+    unsigned char elf_header[ELF_HEADER_SIZE]; // elf header: first 64 bytes
+    if (fd == -1) return;
+
+    read(fd, elf_header, ELF_HEADER_SIZE);
+
+    unsigned long long res = 0;
+    for (size_t i = ELF_ENTRY_POINT_SIZE + ELF_ENTRY_POINT_OFFSET - 1; i >= ELF_ENTRY_POINT_OFFSET; i--) {
+        res = res * 256 + elf_header[i];
     }
-    if (info.pid == 0) {
-        if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {
-            errquit("** [load] traceme\n");
-        }
+    info.entry_point = res;
+}
+
+void _load() {
+    info.pid = fork();
+    if (info.pid < 0) {
+        err_quit("**[load] fail to fork\n");
+    } else if (info.pid == 0) { // child process run the program
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) err_quit("** [load] traceme\n");
         char *argv[] = {strdup(info.loaded_prog.c_str()), NULL};
-        execvp(argv[0], argv);
-        errquit("** [load] execvp\n");
+        if (execvp(argv[0], argv) < 0) err_quit("** [load] execvp\n");
     } else {
         int status;
-        if (waitpid(info.pid, &status, 0) < 0) {
-            errquit("** [load] waitpid");
-        }
+        if (waitpid(info.pid, &status, 0) < 0) err_quit("** [load] waitpid");
         ptrace(PTRACE_SETOPTIONS, info.pid, 0, PTRACE_O_EXITKILL);
 
         set_entry_point(info.loaded_prog.c_str());
@@ -522,15 +505,48 @@ void _load() {
     }
 }
 
+static void init_text_segment_addr() {
+    ifstream text_if("/proc/" + to_string(info.pid) + "/stat");
+    if (!text_if.is_open()) {
+        err_quit("** vmmap fail to open the stat file\n");
+    } else {
+        string line;
+
+        if (!getline(text_if, line)) {
+            err_quit("** vmmap fail to getline from stat\n");
+        }
+        auto item = split_str(line);
+        // start and end place
+        info.text_start = _stoull(item[25]);
+        info.text_end = _stoull(item[26]);
+    }
+    return;
+}
+
 void load(vector<string> argv) {
     if (info.state != not_load) {
         dprintf(STDERR_FILENO, "** The program has alreay been load. entry point 0x%llx\n", info.entry_point);
         return;
     }
+
     info.loaded_prog = argv[1];
     _load();
     dprintf(STDERR_FILENO, "** program '%s' loaded. entry point 0x%llx\n", info.loaded_prog.c_str(), info.entry_point);
     init_text_segment_addr();
+}
+
+void start(vector<string> argv) {
+    check_state(loaded);
+
+    dprintf(STDERR_FILENO, "** pid %d\n", info.pid);
+    info.state = running;
+}
+
+static void repatch_bps() {
+    for (auto bp = info.bps.begin(); bp != info.bps.end(); ++bp) {
+        auto code = ptrace(PTRACE_PEEKTEXT, info.pid, bp->addr, 0);
+        ptrace(PTRACE_POKETEXT, info.pid, bp->addr, (code & 0xffffffffffffff00) | 0xcc);
+    }
 }
 
 void run(vector<string> argv) {
@@ -548,77 +564,87 @@ void run(vector<string> argv) {
 
 void vmmap(vector<string> argv) {
     check_state(running);
+
     ifstream maps_if("/proc/" + to_string(info.pid) + "/maps");
-    if (!maps_if.is_open()) {
-        errquit("** vmmap fail to open the maps file\n");
-    } else {
-        string line;
-        while (true) {
-            if (!getline(maps_if, line)) {
-                break;
-            }
-            auto item = split_str(line);
-            /* format the output */
-            auto dash = item[vm_region].find('-');
-            string start_str = item[vm_region].substr(0, dash);
-            string end_str = item[vm_region].substr(dash + 1, item[vm_region].size() - dash);
-            unsigned long long start = stoull(start_str, NULL, 16);
-            unsigned long long end = stoull(end_str, NULL, 16);
+    if (!maps_if.is_open()) err_quit("** vmmap fail to open the maps file\n");
 
-            string flags = item[vm_flags].substr(0, 3);
+    string line = "";
+    while (getline(maps_if, line)) {
+        vector<string> item = split_str(line);
+        // format the output
+        auto dash = item[vm_region].find('-');
+        string start_str = item[vm_region].substr(0, dash);
+        string end_str = item[vm_region].substr(dash + 1, item[vm_region].size() - dash);
+        unsigned long long start = stoull(start_str, NULL, 16);
+        unsigned long long end = stoull(end_str, NULL, 16);
 
-            unsigned long long offset = stoull(item[vm_pgoff], NULL, 16);
+        string flags = item[vm_flags].substr(0, 3);
 
-            dprintf(STDERR_FILENO, "%016llx-%016llx %s %llx        %s\n", start, end, flags.c_str(), offset, item[vm_path].c_str());
-        }
+        unsigned long long offset = stoull(item[vm_pgoff], NULL, 16);
+
+        dprintf(STDERR_FILENO, "%016llx-%016llx %s %llx        %s\n", start, end, flags.c_str(), offset, item[vm_path].c_str());
     }
-    return;
-}
-
-void start(vector<string> argv) {
-    check_state(loaded);
-    dprintf(STDERR_FILENO, "** pid %d\n", info.pid);
-    info.state = running;
 }
 
 void exit(vector<string> argv) {
     exit(0);
 }
 
+/* helper functions */
+static void init_commands() {
+    commands["break"] = &set_bp;
+    commands["b"] = &set_bp;
+    commands["cont"] = &cont;
+    commands["c"] = &cont;
+    commands["delete"] = &delete_bp;
+    commands["disasm"] = &disasm;
+    commands["dump"] = &dump;
+    commands["x"] = &dump;
+    commands["exit"] = &exit;
+    commands["q"] = &exit;
+    commands["get"] = &get_reg;
+    commands["g"] = &get_reg;
+    commands["getregs"] = &get_all_regs;
+    commands["help"] = &help;
+    commands["h"] = &help;
+    commands["list"] = &list_bp;
+    commands["l"] = &list_bp;
+    commands["load"] = &load;
+    commands["run"] = &run;
+    commands["r"] = &run;
+    commands["vmmap"] = &vmmap;
+    commands["m"] = &vmmap;
+    commands["set"] = &set_reg;
+    commands["s"] = &set_reg;
+    commands["si"] = &single_step;
+    commands["start"] = &start;
+}
+
 int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    struct arguments args = parse_arg(argc, argv);
-    if (args.is_invalid) return 1;
+    arguments args = parse_arg(argc, argv);
 
     init_commands();
 
+    // load program if it's a parameter
     ifstream script_if(args.script);
     if (!args.script.empty()) {
-        if (!script_if.is_open()) {
-            errquit("** open script failed.\n");
-            return 1;
-        }
+        if (!script_if.is_open()) err_quit("** open script failed.\n");
         args.is_script = true;
     }
-    if (!args.prog_path.empty()) {
-        call_cmd({"load", args.prog_path});
-    }
+    if (!args.program_path.empty()) call_cmd({"load", args.program_path});
+
+    // load program from input
     while (true) {
-        if (!args.is_script) {
-            cerr << "sdb> ";
-        }
+        if (!args.is_script) cerr << "sdb> ";
         
-        string cmd;
-        if (!getline(args.is_script ? script_if : cin, cmd)) {
-            break;
-        }
+        string cmd = "";
+        if (!getline(args.is_script ? script_if : cin, cmd)) break;
 
         vector<string> input_list = split_str(cmd);
-        if (!input_list.empty()) {
-            call_cmd(input_list);        
-        }
+        if (!input_list.empty()) call_cmd(input_list);
     }    
     
     return 0;

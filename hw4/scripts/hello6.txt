@@ -1,0 +1,9 @@
+load sample/hello64
+start
+disasm
+disasm 0x4000b0
+b 0x4000c6
+disasm 0x4000c6
+cont
+disasm 0x4000c6
+dump 0x4000c6
