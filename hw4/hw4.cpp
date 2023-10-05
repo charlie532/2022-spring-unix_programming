@@ -273,6 +273,7 @@ void set_bp(vector<string> argv) {
 }
 
 void delete_bp(vector<string> argv) {
+    check_state(running);
     check_argv(argv, "id");
 
     int target_id = stoi(argv[1], NULL, 10);
@@ -282,6 +283,8 @@ void delete_bp(vector<string> argv) {
         ptrace(PTRACE_POKETEXT, info.pid, bp->addr, (code & 0xffffffffffffff00) | bp->origin_content); // replace 0xcc
         info.bps.erase(bp);
         dprintf(STDERR_FILENO, "** breakpoint %d deleted.\n", target_id);
+    } else {
+        dprintf(STDERR_FILENO, "** breakpoint %d is not exist.\n", target_id);
     }
 }
 
